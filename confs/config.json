@@ -1,0 +1,17 @@
+{
+  "version": 17,
+  "money": {
+    "default": 14,
+    "click": 8,
+    "inter": 1
+  },
+  "urls": {
+    "withdraw": "https://withdraw.therrabook.ru",
+    "social": [
+      "https://t.me/therrabook",
+      "https://t.me/therrabooksupport",
+      "https://vk.com/therrabook"
+    ]
+  }
+}
+
