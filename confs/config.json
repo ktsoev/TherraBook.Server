@@ -1,9 +1,8 @@
 {
   "version": 17,
   "money": {
-    "default": 14,
-    "click": 8,
-    "inter": 1
+    "default": 1,
+    "click": 1
   },
   "urls": {
     "withdraw": "https://withdraw.therrabook.ru",

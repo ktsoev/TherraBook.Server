@@ -408,12 +408,6 @@ async def get_balance(user_data: TokenData = Depends(verify_token), db: Session 
         raise HTTPException(status_code=404, detail="error")
     return {"balance": user.balance}
 
-@app.get("/updateParams/")
-async def update_params(password: str):
-    if password != os.getenv("UPDATE_PASSWORD", "CHANGE_THIS_PASSWORD091267655623625464564765857999098765439"):
-        raise HTTPException(status_code=400, detail="error")
-    return {"ok"}
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
