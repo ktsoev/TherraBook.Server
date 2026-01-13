@@ -103,11 +103,9 @@ def load_config():
     with open(CONFIG_FILE, 'r') as file:
         return json.load(file)
 
-config = load_config()
-
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    expire = datetime.datetime.now(datetime.UTC) + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -264,6 +262,7 @@ async def auth(user_id: str,
     verify_hmac(user_id, signature, HMAC_SECRET)
     user = get_or_create_user(db, user_id)
     access_token = create_access_token(data={"sub": user.user_id})
+    config = load_config()
     return {
         "id": user.id,
         "balance": user.balance,
@@ -282,6 +281,7 @@ async def login(user_id: str,
     if user is None:
         raise HTTPException(status_code=401, detail="error")
     access_token = create_access_token(data={"sub": user.user_id})
+    config = load_config()
     return {
         "id": user.id,
         "balance": user.balance,
@@ -306,6 +306,7 @@ async def add(user_data: TokenData = Depends(verify_token),
         if not user or user.balance < 0:
             raise HTTPException(status_code=400, detail="User error")
 
+        config = load_config()
         user.balance += config["money"]["default"]
         
         db.commit()
@@ -334,6 +335,7 @@ async def add_click(user_data: TokenData = Depends(verify_token),
             raise HTTPException(status_code=400, detail="User not found")
         if user.balance < 0:
             raise HTTPException(status_code=400, detail="User is banned")
+        config = load_config()
         user.balance += config["money"]["click"]
         db.commit()
         return {"balance": user.balance}
@@ -410,8 +412,6 @@ async def get_balance(user_data: TokenData = Depends(verify_token), db: Session 
 async def update_params(password: str):
     if password != os.getenv("UPDATE_PASSWORD", "CHANGE_THIS_PASSWORD091267655623625464564765857999098765439"):
         raise HTTPException(status_code=400, detail="error")
-    global config
-    config = load_config()
     return {"ok"}
 
 if __name__ == "__main__":
