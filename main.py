@@ -175,7 +175,7 @@ def get_user(db: Session, user_id: str):
         os.system("systemctl restart therrabook.service")
         exit(1) 
 
-app = FastAPI()
+noapp = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 # CORS
 origins = [
