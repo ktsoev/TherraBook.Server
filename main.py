@@ -7,10 +7,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from starlette.responses import Response
-from sqlalchemy import create_engine, Column, Integer, String, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, BigInteger, Enum, Text, TIMESTAMP, func
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timedelta, timezone
+import enum
 from telegram import Bot
 import sqlalchemy.exc
 import base64
@@ -23,7 +24,7 @@ import hashlib
 import time
 import logging
 from dotenv import load_dotenv
-from telegram_utils import send_telegram_message, send_transaction_notification
+from telegram_utils import send_telegram_message
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -78,11 +79,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class WithdrawalStatus(enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    REJECTED = "rejected"
+
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(255), unique=True, nullable=False)
+    user_id = Column(String(255), unique=True, nullable=False, index=True)
     balance = Column(Integer, default=0)
+    total_earned = Column(Integer, default=0)
+    total_withdrawn = Column(Integer, default=0)
+    ads_watched = Column(Integer, default=0)
+    is_banned = Column(Boolean, default=False)
+    last_active_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+
+class Withdrawal(Base):
+    __tablename__ = "withdrawals"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(String(255), nullable=False, index=True)
+    amount = Column(Integer, nullable=False)
+    status = Column(
+        Enum(WithdrawalStatus, native_enum=False, length=20),
+        default=WithdrawalStatus.PENDING,
+        nullable=False
+    )
+    payment_method = Column(String(50), nullable=True)
+    payment_details = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    completed_at = Column(TIMESTAMP, nullable=True)
 
 class TransactionRequest(BaseModel):
     price: int
@@ -152,10 +182,22 @@ def get_or_create_user(db: Session, user_id: str):
     try:
         user = db.query(User).filter(User.user_id == user_id).first()
         if not user:
-            user = User(user_id=user_id)
+            user = User(
+                user_id=user_id,
+                balance=0,
+                total_earned=0,
+                total_withdrawn=0,
+                ads_watched=0,
+                is_banned=False,
+                last_active_at=datetime.now(timezone.utc)
+            )
             db.add(user)
             db.commit()
             db.refresh(user)
+        else:
+            # Обновляем last_active_at при каждом обращении
+            user.last_active_at = datetime.now(timezone.utc)
+            db.commit()
         return user
     except sqlalchemy.exc.TimeoutError:
         logger.error("SQL timeout in get_or_create_user, restarting service")
@@ -261,6 +303,11 @@ async def auth(user_id: str,
                signature: str = Header(...)):
     verify_hmac(user_id, signature, HMAC_SECRET)
     user = get_or_create_user(db, user_id)
+    
+    # Проверяем, не забанен ли пользователь
+    if user.is_banned:
+        raise HTTPException(status_code=403, detail="User is banned")
+    
     access_token = create_access_token(data={"sub": user.user_id})
     config = load_config()
     return {
@@ -280,6 +327,15 @@ async def login(user_id: str,
     user = get_user(db, user_id)
     if user is None:
         raise HTTPException(status_code=401, detail="error")
+    
+    # Проверяем, не забанен ли пользователь
+    if user.is_banned:
+        raise HTTPException(status_code=403, detail="User is banned")
+    
+    # Обновляем last_active_at
+    user.last_active_at = datetime.now(timezone.utc)
+    db.commit()
+    
     access_token = create_access_token(data={"sub": user.user_id})
     config = load_config()
     return {
@@ -303,11 +359,14 @@ async def add(user_data: TokenData = Depends(verify_token),
         verify_hmac(f"{user_data.user_id}:{timestamp}", signature, HMAC_SECRET)
 
         user = db.query(User).filter(User.user_id == user_data.user_id).first()
-        if not user or user.balance < 0:
+        if not user or user.is_banned or user.balance < 0:
             raise HTTPException(status_code=400, detail="User error")
 
         config = load_config()
-        user.balance += config["money"]["default"]
+        amount = config["money"]["default"]
+        user.balance += amount
+        user.total_earned += amount
+        user.last_active_at = datetime.now(timezone.utc)
         
         db.commit()
         return {"balance": user.balance}
@@ -333,10 +392,13 @@ async def add_click(user_data: TokenData = Depends(verify_token),
         user = db.query(User).filter(User.user_id == user_data.user_id).first()
         if not user:
             raise HTTPException(status_code=400, detail="User not found")
-        if user.balance < 0:
+        if user.is_banned or user.balance < 0:
             raise HTTPException(status_code=400, detail="User is banned")
         config = load_config()
-        user.balance += config["money"]["click"]
+        amount = config["money"]["click"]
+        user.balance += amount
+        user.total_earned += amount
+        user.last_active_at = datetime.now(timezone.utc)
         db.commit()
         return {"balance": user.balance}
     except HTTPException:
@@ -358,7 +420,7 @@ async def withdraw(request: TransactionRequest,
         user = db.query(User).filter(User.user_id == user_data.user_id).first()
         if not user:
             raise HTTPException(status_code=400, detail="User not found")
-        if user.balance < 0:
+        if user.is_banned or user.balance < 0:
             raise HTTPException(status_code=400, detail="User is banned")
         if user.balance < request.amount:
             raise HTTPException(status_code=400, detail="Insufficient balance")
@@ -371,22 +433,33 @@ async def withdraw(request: TransactionRequest,
             logger.error(f"Decryption error: {str(e)}")
             raise HTTPException(status_code=400, detail="Invalid encrypted address")
         
-        user.balance -= request.amount
-        db.commit()
+        # Создаем запись о выводе в базе данных
+        withdrawal = Withdrawal(
+            user_id=user.user_id,
+            amount=request.amount,
+            status=WithdrawalStatus.PENDING,
+            payment_method=request.pay_method,
+            payment_details=wallet_address
+        )
+        db.add(withdrawal)
         
-        transaction_data = {
-            'payment_method': request.pay_method,
-            'amount': "{:,}".format(request.price).replace(",", " "),
-            'details': wallet_address,
-            'stars': "{:,}".format(request.amount).replace(",", " "),
-            'user_id': user.id,
-            'user_balance': "{:,}".format(user.balance).replace(",", " "),
-            'ip_address': client_ip
-        }
-        await send_transaction_notification(transaction_data)
+        # Обновляем баланс пользователя и статистику
+        user.balance -= request.amount
+        user.total_withdrawn += request.amount
+        user.last_active_at = datetime.now(timezone.utc)
+        
+        db.commit()
+        db.refresh(withdrawal)
+        
+        logger.info(
+            f"Withdrawal created: ID={withdrawal.id}, User={user.user_id}, "
+            f"Amount={request.amount}, Method={request.pay_method}, IP={client_ip}"
+        )
+        
         return {
             "balance": user.balance,
-            "status": "pending_manual"
+            "status": "pending",
+            "withdrawal_id": withdrawal.id
         }
 
     except HTTPException:
@@ -395,10 +468,13 @@ async def withdraw(request: TransactionRequest,
     except Exception as e:
         db.rollback()
         logger.error(f"Unexpected error in withdraw: {str(e)}")
-        try:
-            await send_telegram_message(f"withdraw error: {user_data.user_id if user_data else 'unknown'} : {request.price} : {request.pay_method} : {request.address} : {str(e)}")
-        except:
-            pass
+        #try:
+        #    await send_telegram_message(
+        #        f"Withdraw error: {user_data.user_id if user_data else 'unknown'} : "
+        #        f"{request.price} : {request.pay_method} : {request.address} : {str(e)}"
+        #    )
+        #except Exception as telegram_error:
+        #    logger.error(f"Failed to send telegram error notification: {str(telegram_error)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/balance/")
