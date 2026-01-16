@@ -7,7 +7,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from starlette.responses import Response
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, BigInteger, Enum, Text, TIMESTAMP, func, TypeDecorator
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, BigInteger, Enum, Text, TIMESTAMP, func, TypeDecorator, Numeric
+from decimal import Decimal
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timedelta, timezone
@@ -133,11 +134,24 @@ class User(Base):
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
 
+class WithdrawalOption(Base):
+    __tablename__ = "withdrawal_options"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    payment_method = Column(String(50), nullable=False, index=True)
+    amount = Column(Numeric(10, 2), nullable=False)  # Денежная сумма (10.00, 25.00 и т.д.)
+    stars = Column(Integer, nullable=False)  # Количество звезд
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+
 class Withdrawal(Base):
     __tablename__ = "withdrawals"
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     user_id = Column(String(255), nullable=False, index=True)
-    amount = Column(Integer, nullable=False)
+    withdrawal_option_id = Column(Integer, nullable=True, index=True)
+    amount = Column(Numeric(10, 2), nullable=True)
+    stars_amount = Column(Integer, nullable=False)
     status = Column(
         WithdrawalStatusType(),
         default=WithdrawalStatus.PENDING,
@@ -148,11 +162,10 @@ class Withdrawal(Base):
     created_at = Column(TIMESTAMP, server_default=func.now())
     completed_at = Column(TIMESTAMP, nullable=True)
 
-class TransactionRequest(BaseModel):
-    price: int
-    amount: int
-    pay_method: str
-    address: str
+
+class WithdrawRequest(BaseModel):
+    option_id: int  # ID плашки вывода
+    address: str  # Зашифрованный адрес кошелька
 
 Base.metadata.create_all(bind=engine)
 
@@ -445,8 +458,47 @@ async def add_click(user_data: TokenData = Depends(verify_token),
         logger.error(f"Error in add-click: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@app.get("/withdrawal-options/")
+async def get_withdrawal_options(db: Session = Depends(get_db)):
+    """Возвращает список доступных плашек для вывода средств"""
+    try:
+        options = db.query(WithdrawalOption).filter(
+            WithdrawalOption.is_active == True
+        ).order_by(
+            WithdrawalOption.payment_method,
+            WithdrawalOption.amount
+        ).all()
+        
+        # Группируем по payment_method для удобства фронтенда
+        grouped_options = {}
+        for option in options:
+            method = option.payment_method
+            if method not in grouped_options:
+                grouped_options[method] = []
+            
+            grouped_options[method].append({
+                "id": option.id,
+                "amount": float(option.amount),
+                "stars": option.stars
+            })
+        
+        # Преобразуем в формат, который ожидает фронтенд
+        result = []
+        for method, options_list in grouped_options.items():
+            result.append({
+                "name": method,
+                "icon": f"/images/{method.lower()}.png",
+                "options": options_list
+            })
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error in get_withdrawal_options: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.post("/withdraw/")
-async def withdraw(request: TransactionRequest,
+async def withdraw(request: WithdrawRequest,
                    user_data: TokenData = Depends(verify_token), 
                    db: Session = Depends(get_db),
                    signature: str = Header(...),
@@ -458,10 +510,21 @@ async def withdraw(request: TransactionRequest,
             raise HTTPException(status_code=400, detail="User not found")
         if user.is_banned or user.balance < 0:
             raise HTTPException(status_code=400, detail="User is banned")
-        if user.balance < request.amount:
+        
+        # Получаем плашку вывода из БД
+        withdrawal_option = db.query(WithdrawalOption).filter(
+            WithdrawalOption.id == request.option_id,
+            WithdrawalOption.is_active == True
+        ).first()
+        
+        if not withdrawal_option:
+            raise HTTPException(status_code=400, detail="Invalid withdrawal option")
+        
+        # Проверяем баланс пользователя
+        if user.balance < withdrawal_option.stars:
             raise HTTPException(status_code=400, detail="Insufficient balance")
         
-        verify_hmac(f"{user_data.user_id}:{request.amount}:{timestamp}", signature, HMAC_SECRET_WITHDRAW)
+        verify_hmac(f"{user_data.user_id}:{withdrawal_option.stars}:{timestamp}", signature, HMAC_SECRET_WITHDRAW)
 
         try:
             wallet_address = decrypt(request.address)
@@ -472,16 +535,18 @@ async def withdraw(request: TransactionRequest,
         # Создаем запись о выводе в базе данных
         withdrawal = Withdrawal(
             user_id=user.user_id,
-            amount=request.amount,
+            withdrawal_option_id=withdrawal_option.id,
+            amount=withdrawal_option.amount,
+            stars_amount=withdrawal_option.stars,
             status=WithdrawalStatus.PENDING,
-            payment_method=request.pay_method,
+            payment_method=withdrawal_option.payment_method,
             payment_details=wallet_address
         )
         db.add(withdrawal)
         
         # Обновляем баланс пользователя и статистику
-        user.balance -= request.amount
-        user.total_withdrawn += request.amount
+        user.balance -= withdrawal_option.stars
+        user.total_withdrawn += withdrawal_option.stars
         user.last_active_at = datetime.now(timezone.utc)
         
         db.commit()
@@ -489,7 +554,8 @@ async def withdraw(request: TransactionRequest,
         
         logger.info(
             f"Withdrawal created: ID={withdrawal.id}, User={user.user_id}, "
-            f"Amount={request.amount}, Method={request.pay_method}, IP={client_ip}"
+            f"Option ID={withdrawal_option.id}, Amount=${withdrawal_option.amount}, "
+            f"Stars={withdrawal_option.stars}, Method={withdrawal_option.payment_method}, IP={client_ip}"
         )
         
         return {
@@ -504,13 +570,6 @@ async def withdraw(request: TransactionRequest,
     except Exception as e:
         db.rollback()
         logger.error(f"Unexpected error in withdraw: {str(e)}")
-        #try:
-        #    await send_telegram_message(
-        #        f"Withdraw error: {user_data.user_id if user_data else 'unknown'} : "
-        #        f"{request.price} : {request.pay_method} : {request.address} : {str(e)}"
-        #    )
-        #except Exception as telegram_error:
-        #    logger.error(f"Failed to send telegram error notification: {str(telegram_error)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/balance/")
