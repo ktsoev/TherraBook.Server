@@ -7,7 +7,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from starlette.responses import Response
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, BigInteger, Enum, Text, TIMESTAMP, func
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, BigInteger, Enum, Text, TIMESTAMP, func, TypeDecorator
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timedelta, timezone
@@ -85,6 +85,40 @@ class WithdrawalStatus(enum.Enum):
     REJECTED = "rejected"
 
 
+class WithdrawalStatusType(TypeDecorator):
+    """Кастомный тип для работы с Enum статусов выводов"""
+    impl = String(20)
+    cache_ok = True
+    
+    def process_bind_param(self, value, dialect):
+        """Преобразует Enum в строку при сохранении в БД"""
+        if value is None:
+            return None
+        if isinstance(value, WithdrawalStatus):
+            return value.value
+        if isinstance(value, str):
+            # Проверяем, что значение валидно
+            valid_values = [e.value for e in WithdrawalStatus]
+            if value not in valid_values:
+                raise ValueError(f"Invalid withdrawal status: {value}")
+            return value
+        return str(value)
+    
+    def process_result_value(self, value, dialect):
+        """Преобразует строку из БД в Enum объект"""
+        if value is None:
+            return None
+        if isinstance(value, WithdrawalStatus):
+            return value
+        try:
+            # Преобразуем строку в Enum
+            return WithdrawalStatus(value)
+        except ValueError:
+            # Если значение не найдено в Enum, логируем и возвращаем PENDING по умолчанию
+            logger.warning(f"Unknown withdrawal status value in DB: {value}, defaulting to PENDING")
+            return WithdrawalStatus.PENDING
+
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -105,7 +139,7 @@ class Withdrawal(Base):
     user_id = Column(String(255), nullable=False, index=True)
     amount = Column(Integer, nullable=False)
     status = Column(
-        Enum(WithdrawalStatus, native_enum=False, length=20),
+        WithdrawalStatusType(),
         default=WithdrawalStatus.PENDING,
         nullable=False
     )
