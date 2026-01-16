@@ -259,6 +259,8 @@ origins = [
     "http://127.0.0.1:8000",
     "http://api.therrabook.ru",
     "https://api.therrabook.ru",
+    "https://therrabook.osaku.ru",
+    "https://therrabook.osaku.ru"
 ]
 
 class CORSMiddleware(BaseHTTPMiddleware):
