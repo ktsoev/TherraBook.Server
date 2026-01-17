@@ -365,7 +365,8 @@ async def auth(user_id: str,
         "access_token": access_token,
         "social_links": config["urls"]["social"],
         "withdraw_url": config["urls"]["withdraw"],
-        "version": config["version"]
+        "version": config["version"],
+        "ads": config["ads"]
     }
 
 @app.post("/login/")

@@ -11,6 +11,12 @@
       "https://t.me/therrabooksupport",
       "https://vk.com/therrabook"
     ]
+  },
+  "ads": {
+    "yandex": {
+      "rewarded_ad_unit_id": "R-M-1234567890",
+      "enabled": true
+    }
   }
 }
 
